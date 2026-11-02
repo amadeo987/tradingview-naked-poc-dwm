@@ -1,0 +1,386 @@
+//@version=6
+indicator("[ad] Naked POC D/W/M v1.3.0", shorttitle = "[ad] nPOC", overlay = true, max_lines_count = 300, max_labels_count = 300, max_bars_back = 5000)
+
+// Completed D/W/M profiles use a deterministic OHLCV approximation.
+// Profile reconstruction and the entire level lifecycle run in the sample context,
+// so lower chart timeframes do not lose levels that predate their loaded candles.
+string GROUP_PROFILE = "Volume profile"
+string GROUP_LEVELS = "Visible levels"
+string GROUP_TOUCH = "Touched-level lifecycle"
+string GROUP_STYLE = "Appearance"
+string GROUP_ALERTS = "Alerts"
+
+// Keep the input declaration order unchanged to preserve existing input IDs.
+string profileTfInput = input.timeframe("60", "Profile sample timeframe", options = ["15", "30", "60", "120", "240"], tooltip = "Uses the same sample history on every chart timeframe. Smaller samples improve granularity but increase processing cost. Default: 1 hour.", group = GROUP_PROFILE)
+int profileRowsInput = input.int(24, "Profile rows", minval = 5, maxval = 200, tooltip = "Match the Rows setting in Periodic Volume Profile. Default: 24. This is an OHLCV approximation, not TradingView's private PVP engine.", group = GROUP_PROFILE)
+bool showDailyInput = input.bool(true, "Show naked Daily POC", group = GROUP_LEVELS)
+bool showWeeklyInput = input.bool(true, "Show naked Weekly POC", group = GROUP_LEVELS)
+bool showMonthlyInput = input.bool(true, "Show naked Monthly POC", group = GROUP_LEVELS)
+int nearestDailyInput = input.int(8, "Nearest Daily levels", minval = 1, maxval = 30, tooltip = "Maximum number of nearest active Daily levels. Applies equally to all chart timeframes.", group = GROUP_LEVELS)
+int nearestWeeklyInput = input.int(14, "Nearest Weekly levels", minval = 1, maxval = 40, tooltip = "Maximum number of nearest active Weekly levels. Applies equally to all chart timeframes.", group = GROUP_LEVELS)
+int nearestMonthlyInput = input.int(20, "Nearest Monthly levels", minval = 1, maxval = 60, tooltip = "Maximum number of nearest active Monthly levels. Applies equally to all chart timeframes.", group = GROUP_LEVELS)
+int lingerBarsInput = input.int(12, "Remove after sample bars since first touch", minval = 0, maxval = 100, tooltip = "After its first confirmed wick touch, a level fades and remains for this many closed profile-sample bars. This duration does not depend on the chart timeframe.", group = GROUP_TOUCH)
+bool removeSecondTouchInput = input.bool(true, "Remove on second touch", tooltip = "A touch on a later closed sample bar removes the level immediately.", group = GROUP_TOUCH)
+bool showLabelsInput = input.bool(true, "Show labels", group = GROUP_STYLE)
+color dailyColorInput = input.color(color.rgb(0, 150, 136), "Daily color", group = GROUP_STYLE)
+color weeklyColorInput = input.color(color.rgb(126, 87, 194), "Weekly color", group = GROUP_STYLE)
+color monthlyColorInput = input.color(color.rgb(0, 188, 212), "Monthly color", group = GROUP_STYLE)
+bool alertsInput = input.bool(false, "Enable alert() router", tooltip = "Enable this option, then create one TradingView alert using Any alert() function call. Recreate existing alerts after updating the script.", group = GROUP_ALERTS)
+bool alertNewInput = input.bool(true, "Alert: new naked POC", group = GROUP_ALERTS)
+bool alertTouchInput = input.bool(true, "Alert: first touch", group = GROUP_ALERTS)
+int labelOffsetInput = input.int(80, "Label offset to the right (chart bars)", minval = 1, maxval = 450, tooltip = "Distance from the latest chart candle. Default: 80 chart bars. Adjust for your right margin; labels are not pinned to the price axis.", group = GROUP_STYLE)
+
+int MASK_D = 1
+int MASK_W = 2
+int MASK_M = 4
+int MAX_STORED_LEVELS = 260
+int REQUEST_BARS = 50000
+int LINE_WIDTH = 1
+
+// Only a bounded latest snapshot crosses the request boundary. Returning the
+// full arrays on every historical chart candle would waste memory.
+type LevelSnapshot
+    array<float> prices
+    array<int> masks
+    array<int> starts
+    array<int> origins
+    array<int> touches
+    array<string> eventNames
+    array<int> eventMasks
+    array<float> eventPrices
+    int sourceTime
+    int historyStart
+    float dailyPoc
+    float weeklyPoc
+    float monthlyPoc
+
+// Histogram row quantization and proportional volume allocation are unchanged.
+profilePoc(array<float> highs, array<float> lows, array<float> volumes, array<float> closes, int requestedRows) =>
+    int sampleCount = array.size(highs)
+    float result = na
+    if sampleCount > 0
+        float profileLow = array.min(lows)
+        float profileHigh = array.max(highs)
+        float profileRange = profileHigh - profileLow
+        if profileRange <= syminfo.mintick
+            result := array.get(closes, sampleCount - 1)
+        else
+            float rawTicksPerRow = profileRange / syminfo.mintick / requestedRows
+            int ticksDown = math.max(1, int(math.floor(rawTicksPerRow)))
+            int ticksUp = math.max(1, int(math.ceil(rawTicksPerRow)))
+            int rowsWithDown = int(math.ceil(profileRange / (ticksDown * syminfo.mintick)))
+            int rowsWithUp = int(math.ceil(profileRange / (ticksUp * syminfo.mintick)))
+            int downError = math.abs(rowsWithDown - requestedRows)
+            int upError = math.abs(rowsWithUp - requestedRows)
+            int ticksPerRow = upError <= downError ? ticksUp : ticksDown
+            float binSize = ticksPerRow * syminfo.mintick
+            int bins = math.max(1, int(math.ceil(profileRange / binSize)))
+            array<float> histogram = array.new_float(bins, 0.0)
+            for sampleIndex = 0 to sampleCount - 1
+                float barHigh = array.get(highs, sampleIndex)
+                float barLow = array.get(lows, sampleIndex)
+                float barClose = array.get(closes, sampleIndex)
+                float barVolume = nz(array.get(volumes, sampleIndex), 0.0)
+                float barRange = barHigh - barLow
+                if barRange <= syminfo.mintick
+                    int singleBin = math.max(0, math.min(bins - 1, int(math.floor((barClose - profileLow) / binSize))))
+                    array.set(histogram, singleBin, array.get(histogram, singleBin) + barVolume)
+                else
+                    int firstBin = math.max(0, math.min(bins - 1, int(math.floor((barLow - profileLow) / binSize))))
+                    int lastBin = math.max(0, math.min(bins - 1, int(math.floor((barHigh - profileLow) / binSize))))
+                    for binIndex = firstBin to lastBin
+                        float binLow = profileLow + binIndex * binSize
+                        float binHigh = binLow + binSize
+                        float overlap = math.max(0.0, math.min(barHigh, binHigh) - math.max(barLow, binLow))
+                        float allocatedVolume = barVolume * overlap / barRange
+                        array.set(histogram, binIndex, array.get(histogram, binIndex) + allocatedVolume)
+            float maxVolume = array.max(histogram)
+            int pocBin = array.indexof(histogram, maxVolume)
+            result := profileLow + (pocBin + 0.5) * binSize
+    result
+
+clearSamples(array<float> highs, array<float> lows, array<float> volumes, array<float> closes) =>
+    array.clear(highs)
+    array.clear(lows)
+    array.clear(volumes)
+    array.clear(closes)
+
+pushSample(array<float> highs, array<float> lows, array<float> volumes, array<float> closes) =>
+    array.push(highs, high)
+    array.push(lows, low)
+    array.push(volumes, volume)
+    array.push(closes, close)
+
+profileEngine(int profileRows) =>
+    var array<float> dHighs = array.new_float()
+    var array<float> dLows = array.new_float()
+    var array<float> dVolumes = array.new_float()
+    var array<float> dCloses = array.new_float()
+    var array<float> wHighs = array.new_float()
+    var array<float> wLows = array.new_float()
+    var array<float> wVolumes = array.new_float()
+    var array<float> wCloses = array.new_float()
+    var array<float> mHighs = array.new_float()
+    var array<float> mLows = array.new_float()
+    var array<float> mVolumes = array.new_float()
+    var array<float> mCloses = array.new_float()
+    var float dailyPoc = na
+    var float weeklyPoc = na
+    var float monthlyPoc = na
+    var int dailyEventTime = na
+    var int weeklyEventTime = na
+    var int monthlyEventTime = na
+    var int dailyOriginTime = na
+    var int weeklyOriginTime = na
+    var int monthlyOriginTime = na
+
+    var bool completeDay = time == time("D")
+    var bool completeWeek = time == time("W")
+    var bool completeMonth = time == time("M")
+
+    if timeframe.change("D")
+        if completeDay and array.size(dHighs) > 0
+            dailyPoc := profilePoc(dHighs, dLows, dVolumes, dCloses, profileRows)
+            dailyEventTime := time
+            dailyOriginTime := time("D")[1]
+        clearSamples(dHighs, dLows, dVolumes, dCloses)
+        completeDay := true
+    if timeframe.change("W")
+        if completeWeek and array.size(wHighs) > 0
+            weeklyPoc := profilePoc(wHighs, wLows, wVolumes, wCloses, profileRows)
+            weeklyEventTime := time
+            weeklyOriginTime := time("W")[1]
+        clearSamples(wHighs, wLows, wVolumes, wCloses)
+        completeWeek := true
+    if timeframe.change("M")
+        if completeMonth and array.size(mHighs) > 0
+            monthlyPoc := profilePoc(mHighs, mLows, mVolumes, mCloses, profileRows)
+            monthlyEventTime := time
+            monthlyOriginTime := time("M")[1]
+        clearSamples(mHighs, mLows, mVolumes, mCloses)
+        completeMonth := true
+
+    pushSample(dHighs, dLows, dVolumes, dCloses)
+    pushSample(wHighs, wLows, wVolumes, wCloses)
+    pushSample(mHighs, mLows, mVolumes, mCloses)
+    [dailyPoc, dailyEventTime, weeklyPoc, weeklyEventTime, monthlyPoc, monthlyEventTime, high, low, time, dailyOriginTime, weeklyOriginTime, monthlyOriginTime]
+
+
+// Logical storage contains no drawings and runs entirely on profileTfInput.
+removeStored(array<float> prices, array<int> masks, array<int> starts, array<int> origins, array<int> touches, int index) =>
+    array.remove(prices, index)
+    array.remove(masks, index)
+    array.remove(starts, index)
+    array.remove(origins, index)
+    array.remove(touches, index)
+
+addStored(array<float> prices, array<int> masks, array<int> starts, array<int> origins, array<int> touches, float price, int eventTime, int originTime, int mask) =>
+    array.push(prices, price)
+    array.push(masks, mask)
+    array.push(starts, eventTime)
+    array.push(origins, originTime)
+    array.push(touches, -1)
+
+levelSnapshot(int rows) =>
+    var array<float> prices = array.new_float()
+    var array<int> masks = array.new_int()
+    var array<int> starts = array.new_int()
+    var array<int> origins = array.new_int()
+    var array<int> touches = array.new_int()
+    var int seenDaily = na
+    var int seenWeekly = na
+    var int seenMonthly = na
+    var int historyStart = time
+    array<string> eventNames = array.new_string()
+    array<int> eventMasks = array.new_int()
+    array<float> eventPrices = array.new_float()
+    [dp, de, wp, we, mp, me, sampleHigh, sampleLow, sampleTime, dOrigin, wOrigin, mOrigin] = profileEngine(rows)
+
+    // The [1] offset is applied to every sample value and period event. A
+    // developing sample never fills/removes a level; request bar-state flags
+    // are not used as confirmation signals.
+    int confirmedTime = sampleTime[1]
+    int confirmedStep = bar_index - 1
+    if not na(confirmedTime)
+        if not na(de[1]) and (na(seenDaily) or de[1] != seenDaily)
+            if showDailyInput and not na(dp[1]) and not na(dOrigin[1])
+                addStored(prices, masks, starts, origins, touches, dp[1], de[1], dOrigin[1], MASK_D)
+                array.push(eventNames, "new")
+                array.push(eventMasks, MASK_D)
+                array.push(eventPrices, dp[1])
+            seenDaily := de[1]
+        if not na(we[1]) and (na(seenWeekly) or we[1] != seenWeekly)
+            if showWeeklyInput and not na(wp[1]) and not na(wOrigin[1])
+                addStored(prices, masks, starts, origins, touches, wp[1], we[1], wOrigin[1], MASK_W)
+                array.push(eventNames, "new")
+                array.push(eventMasks, MASK_W)
+                array.push(eventPrices, wp[1])
+            seenWeekly := we[1]
+        if not na(me[1]) and (na(seenMonthly) or me[1] != seenMonthly)
+            if showMonthlyInput and not na(mp[1]) and not na(mOrigin[1])
+                addStored(prices, masks, starts, origins, touches, mp[1], me[1], mOrigin[1], MASK_M)
+                array.push(eventNames, "new")
+                array.push(eventMasks, MASK_M)
+                array.push(eventPrices, mp[1])
+            seenMonthly := me[1]
+
+        // Keep the same bounded store policy, using the sample-context price.
+        while array.size(prices) > MAX_STORED_LEVELS
+            int farthestIndex = 0
+            float farthestDistance = -1.0
+            for index = 0 to array.size(prices) - 1
+                float distance = math.abs(array.get(prices, index) - close[1])
+                if distance > farthestDistance
+                    farthestDistance := distance
+                    farthestIndex := index
+            removeStored(prices, masks, starts, origins, touches, farthestIndex)
+
+        if array.size(prices) > 0
+            for index = array.size(prices) - 1 to 0
+                float price = array.get(prices, index)
+                int touchedAt = array.get(touches, index)
+                bool touchedNow = confirmedTime >= array.get(starts, index) and sampleLow[1] <= price and sampleHigh[1] >= price
+                bool removeNow = false
+                if touchedAt < 0 and touchedNow
+                    array.set(touches, index, confirmedStep)
+                    array.push(eventNames, "first_touch")
+                    array.push(eventMasks, array.get(masks, index))
+                    array.push(eventPrices, price)
+                    removeNow := lingerBarsInput == 0
+                else if touchedAt >= 0
+                    bool secondTouch = removeSecondTouchInput and confirmedStep > touchedAt and touchedNow
+                    bool lingerExpired = confirmedStep - touchedAt >= lingerBarsInput
+                    removeNow := secondTouch or lingerExpired
+                if removeNow
+                    removeStored(prices, masks, starts, origins, touches, index)
+
+    LevelSnapshot result = na
+    if barstate.islast or barstate.islastconfirmedhistory
+        result := LevelSnapshot.new(array.copy(prices), array.copy(masks), array.copy(starts), array.copy(origins), array.copy(touches), eventNames, eventMasks, eventPrices, confirmedTime, historyStart, dp[1], wp[1], mp[1])
+    result
+
+// request.security evaluates the entire fixed sample history, including levels
+// older than the first loaded chart candle. On higher chart timeframes only the
+// final snapshot is needed: all intermediate events have already run inside it.
+LevelSnapshot snapshot = request.security(syminfo.tickerid, profileTfInput, levelSnapshot(profileRowsInput), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, calc_bars_count = REQUEST_BARS)
+
+hasMask(int mask, int flag) =>
+    mask % (flag * 2) >= flag
+
+levelText(int mask) =>
+    switch mask
+        1 => "ndPOC"
+        2 => "nwPOC"
+        => "nmPOC"
+
+levelColor(int mask) =>
+    switch mask
+        1 => dailyColorInput
+        2 => weeklyColorInput
+        => monthlyColorInput
+
+alertPayload(string eventName, int mask, float price, int sourceTime) =>
+    "{\"indicator\":\"ad Naked POC DWM\",\"symbol\":\"" + syminfo.tickerid + "\",\"chart_tf\":\"" + timeframe.period + "\",\"event\":\"" + eventName + "\",\"level_type\":\"" + levelText(mask) + "\",\"level\":" + str.tostring(price, format.mintick) + ",\"price\":" + str.tostring(close, format.mintick) + ",\"bar_time\":" + str.tostring(time) + "}"
+
+// Suppress historical replay alerts and deduplicate source events across ticks.
+varip int lastAlertSourceTime = na
+if barstate.islast and not na(snapshot)
+    if barstate.isrealtime and not na(lastAlertSourceTime) and snapshot.sourceTime != lastAlertSourceTime and alertsInput
+        if array.size(snapshot.eventNames) > 0
+            for index = 0 to array.size(snapshot.eventNames) - 1
+                string eventName = array.get(snapshot.eventNames, index)
+                bool enabled = eventName == "new" ? alertNewInput : alertTouchInput
+                if enabled
+                    alert(alertPayload(eventName, array.get(snapshot.eventMasks, index), array.get(snapshot.eventPrices, index), snapshot.sourceTime), alert.freq_all)
+    lastAlertSourceTime := snapshot.sourceTime
+
+array<float> levelPrices = not na(snapshot) ? snapshot.prices : array.new_float()
+array<int> levelMasks = not na(snapshot) ? snapshot.masks : array.new_int()
+array<int> levelOriginTimes = not na(snapshot) ? snapshot.origins : array.new_int()
+array<int> levelTouchBars = not na(snapshot) ? snapshot.touches : array.new_int()
+var array<line> levelLines = array.new_line(MAX_STORED_LEVELS, na)
+var array<label> levelLabels = array.new_label(MAX_STORED_LEVELS, na)
+
+// Render the shared snapshot using the existing 1 px rays and size-12 labels.
+int labelIndex = bar_index + labelOffsetInput
+if barstate.islast and array.size(levelPrices) > 0
+    for index = 0 to array.size(levelPrices) - 1
+        float levelPrice = array.get(levelPrices, index)
+        int levelMask = array.get(levelMasks, index)
+        float ownDistance = math.abs(levelPrice - close)
+        int closerD = 0
+        int closerW = 0
+        int closerM = 0
+        for otherIndex = 0 to array.size(levelPrices) - 1
+            if otherIndex != index
+                float otherDistance = math.abs(array.get(levelPrices, otherIndex) - close)
+                int otherMask = array.get(levelMasks, otherIndex)
+                if otherDistance < ownDistance or (otherDistance == ownDistance and otherIndex < index)
+                    closerD += hasMask(otherMask, MASK_D) ? 1 : 0
+                    closerW += hasMask(otherMask, MASK_W) ? 1 : 0
+                    closerM += hasMask(otherMask, MASK_M) ? 1 : 0
+        bool visibleByD = hasMask(levelMask, MASK_D) and closerD < nearestDailyInput
+        bool visibleByW = hasMask(levelMask, MASK_W) and closerW < nearestWeeklyInput
+        bool visibleByM = hasMask(levelMask, MASK_M) and closerM < nearestMonthlyInput
+        bool shouldShow = visibleByD or visibleByW or visibleByM
+        line currentLine = array.get(levelLines, index)
+        label currentLabel = array.get(levelLabels, index)
+        if shouldShow
+            bool wasTouched = array.get(levelTouchBars, index) >= 0
+            color baseColor = levelColor(levelMask)
+            color drawColor = color.new(baseColor, wasTouched ? 62 : 0)
+            drawStyle = wasTouched ? line.style_dashed : line.style_solid
+            int lineSecondTime = time_close + int(timeframe.in_seconds() * 1000) * (labelOffsetInput + 500)
+            int lineOriginTime = array.get(levelOriginTimes, index)
+            if na(currentLine)
+                currentLine := line.new(lineOriginTime, levelPrice, lineSecondTime, levelPrice, xloc = xloc.bar_time, extend = extend.right, color = drawColor, style = drawStyle, width = LINE_WIDTH)
+                array.set(levelLines, index, currentLine)
+            else
+                line.set_xy1(currentLine, lineOriginTime, levelPrice)
+                line.set_xy2(currentLine, lineSecondTime, levelPrice)
+                line.set_color(currentLine, drawColor)
+                line.set_style(currentLine, drawStyle)
+                line.set_width(currentLine, LINE_WIDTH)
+                line.set_extend(currentLine, extend.right)
+            if showLabelsInput
+                string labelText = levelText(levelMask)
+                if na(currentLabel)
+                    currentLabel := label.new(labelIndex, levelPrice, labelText, xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_right, color = chart.bg_color, textcolor = drawColor, size = 12, textalign = text.align_right)
+                    array.set(levelLabels, index, currentLabel)
+                else
+                    label.set_xy(currentLabel, labelIndex, levelPrice)
+                    label.set_text(currentLabel, labelText)
+                    label.set_style(currentLabel, label.style_label_right)
+                    label.set_color(currentLabel, chart.bg_color)
+                    label.set_size(currentLabel, 12)
+                    label.set_textcolor(currentLabel, drawColor)
+            else if not na(currentLabel)
+                label.delete(currentLabel)
+                array.set(levelLabels, index, na)
+        else
+            if not na(currentLine)
+                line.delete(currentLine)
+                array.set(levelLines, index, na)
+            if not na(currentLabel)
+                label.delete(currentLabel)
+                array.set(levelLabels, index, na)
+
+
+if barstate.islast
+    int storedCount = array.size(levelPrices)
+    if storedCount < MAX_STORED_LEVELS
+        for index = storedCount to MAX_STORED_LEVELS - 1
+            line unusedLine = array.get(levelLines, index)
+            label unusedLabel = array.get(levelLabels, index)
+            if not na(unusedLine)
+                line.delete(unusedLine)
+                array.set(levelLines, index, na)
+            if not na(unusedLabel)
+                label.delete(unusedLabel)
+                array.set(levelLabels, index, na)
+
+// Diagnostics never add price-pane plots or affect the price scale.
+plot(not na(snapshot) ? snapshot.dailyPoc : na, "Last completed Daily POC", color = dailyColorInput, display = display.data_window)
+plot(not na(snapshot) ? snapshot.weeklyPoc : na, "Last completed Weekly POC", color = weeklyColorInput, display = display.data_window)
+plot(not na(snapshot) ? snapshot.monthlyPoc : na, "Last completed Monthly POC", color = monthlyColorInput, display = display.data_window)
+plot(not na(snapshot) ? array.size(snapshot.prices) : na, "Tracked active nPOC levels", color = color.gray, display = display.data_window)
