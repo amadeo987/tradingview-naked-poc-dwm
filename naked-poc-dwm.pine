@@ -1,5 +1,5 @@
 //@version=6
-indicator("[ad] Naked POC D/W/M v1.3.0", shorttitle = "[ad] nPOC", overlay = true, max_lines_count = 300, max_labels_count = 300, max_bars_back = 5000)
+indicator("[ad] Naked POC D/W/M v1.3.1", shorttitle = "[ad] nPOC", overlay = true, max_lines_count = 300, max_labels_count = 300, max_bars_back = 5000)
 
 // Completed D/W/M profiles use a deterministic OHLCV approximation.
 // Profile reconstruction and the entire level lifecycle run in the sample context,
@@ -138,25 +138,29 @@ profileEngine(int profileRows) =>
     var bool completeWeek = time == time("W")
     var bool completeMonth = time == time("M")
 
+    // End of the completed period (close of its last sample candle). The chart side
+    // starts the ray on the last chart candle of that period that touched the level.
+    int periodEndTime = time_close[1] - 1
+
     if timeframe.change("D")
         if completeDay and array.size(dHighs) > 0
             dailyPoc := profilePoc(dHighs, dLows, dVolumes, dCloses, profileRows)
             dailyEventTime := time
-            dailyOriginTime := time("D")[1]
+            dailyOriginTime := periodEndTime
         clearSamples(dHighs, dLows, dVolumes, dCloses)
         completeDay := true
     if timeframe.change("W")
         if completeWeek and array.size(wHighs) > 0
             weeklyPoc := profilePoc(wHighs, wLows, wVolumes, wCloses, profileRows)
             weeklyEventTime := time
-            weeklyOriginTime := time("W")[1]
+            weeklyOriginTime := periodEndTime
         clearSamples(wHighs, wLows, wVolumes, wCloses)
         completeWeek := true
     if timeframe.change("M")
         if completeMonth and array.size(mHighs) > 0
             monthlyPoc := profilePoc(mHighs, mLows, mVolumes, mCloses, profileRows)
             monthlyEventTime := time
-            monthlyOriginTime := time("M")[1]
+            monthlyOriginTime := periodEndTime
         clearSamples(mHighs, mLows, mVolumes, mCloses)
         completeMonth := true
 
@@ -301,6 +305,44 @@ array<int> levelTouchBars = not na(snapshot) ? snapshot.touches : array.new_int(
 var array<line> levelLines = array.new_line(MAX_STORED_LEVELS, na)
 var array<label> levelLabels = array.new_label(MAX_STORED_LEVELS, na)
 
+// Chart candle data: each level starts on the last candle of its period that
+// touched the level price, whatever the chart timeframe.
+var array<int> chartBarTimes = array.new_int()
+var array<float> chartBarHighs = array.new_float()
+var array<float> chartBarLows = array.new_float()
+if array.size(chartBarTimes) <= bar_index
+    array.push(chartBarTimes, time)
+    array.push(chartBarHighs, high)
+    array.push(chartBarLows, low)
+else
+    array.set(chartBarHighs, bar_index, high)
+    array.set(chartBarLows, bar_index, low)
+
+// Last chart candle of the period ending at periodEnd whose range contains the
+// price (candles overlapping the period count, so coarse timeframes work too);
+// when none does, the closest candle of that period.
+startBarIndex(array<int> times, array<float> highs, array<float> lows, float price, int periodEnd, int periodLength) =>
+    int endBar = array.binary_search_leftmost(times, periodEnd)
+    int result = 0
+    if endBar >= 0
+        float bestDistance = 1.0e18
+        int scan = endBar
+        while scan >= 0
+            float candleLow = array.get(lows, scan)
+            float candleHigh = array.get(highs, scan)
+            float distance = price < candleLow ? candleLow - price : price > candleHigh ? price - candleHigh : 0.0
+            if distance < bestDistance
+                bestDistance := distance
+                result := scan
+            if distance == 0.0 or array.get(times, scan) <= periodEnd + 1 - periodLength
+                break
+            scan -= 1
+        // The period starts before the loaded history and nothing loaded touched the
+        // level: the real start is off-screen, so run the ray from the first loaded candle.
+        if scan < 0 and bestDistance > 0.0
+            result := 0
+    result
+
 // Render the shared snapshot using the existing 1 px rays and size-12 labels.
 int labelIndex = bar_index + labelOffsetInput
 if barstate.islast and array.size(levelPrices) > 0
@@ -331,7 +373,9 @@ if barstate.islast and array.size(levelPrices) > 0
             color drawColor = color.new(baseColor, wasTouched ? 62 : 0)
             drawStyle = wasTouched ? line.style_dashed : line.style_solid
             int lineSecondTime = time_close + int(timeframe.in_seconds() * 1000) * (labelOffsetInput + 500)
-            int lineOriginTime = array.get(levelOriginTimes, index)
+            int periodEnd = array.get(levelOriginTimes, index)
+            int periodLength = hasMask(levelMask, MASK_M) ? 31 * 86400000 : hasMask(levelMask, MASK_W) ? 7 * 86400000 : 86400000
+            int lineOriginTime = array.get(chartBarTimes, startBarIndex(chartBarTimes, chartBarHighs, chartBarLows, levelPrice, periodEnd, periodLength))
             if na(currentLine)
                 currentLine := line.new(lineOriginTime, levelPrice, lineSecondTime, levelPrice, xloc = xloc.bar_time, extend = extend.right, color = drawColor, style = drawStyle, width = LINE_WIDTH)
                 array.set(levelLines, index, currentLine)

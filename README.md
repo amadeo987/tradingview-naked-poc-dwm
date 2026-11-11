@@ -12,6 +12,7 @@ Or add it from TradingView: [Naked Point of Control (Daily, Weekly, Monthly)](ht
 ## Notes
 
 - Profiles are built from 1H OHLCV samples (changeable in the settings), so POC prices can differ slightly from TradingView's built-in volume profile.
+- Each level starts on the last candle of its day, week or month that touched the level, on every chart timeframe.
 - Use standard candles.
 - Optional alerts: enable the alert router in the settings, then create one alert with **Any alert() function call**.
 
